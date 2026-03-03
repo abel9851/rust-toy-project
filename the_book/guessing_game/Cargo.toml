@@ -1,0 +1,10 @@
+[package]
+name = "guessing_game"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# memo the book의 chapter 2를 하고 있는데 0.8.5를 지정하니까 rust analyzer가 0.10.0이 있다며 추천해줬다.
+# 엄청 편리하다.
+
+rand = "0.8.5"
