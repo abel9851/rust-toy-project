@@ -1,0 +1,108 @@
+# rust-toy-project/memory Cursor Rules
+
+이 규칙들은 `/Users/heejunshin/private/rust-toy-project/memory` 크레이트에만 적용한다.
+이 디렉토리는 toy heap allocator 실험용이다.
+
+## Unsafe / static mut HEAP 사용 규칙
+
+- `static mut HEAP: [u8; HEAP_SIZE]` 에 대해 **참조(&, as_ref, as_ptr, as_mut_ptr)를 직접 만들지 않는다.**
+  - 이유: Rust 2024 `static_mut_refs` 룰로 인해 컴파일 오류 및 UB 가능성이 있다.
+- 대신 항상 **raw pointer helper** 를 통해서만 접근한다.
+
+```rust
+const HEAP_SIZE: usize = 1024 * 1024;
+static mut HEAP: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
+
+fn heap_base_ptr() -> *mut u8 {
+    core::ptr::addr_of_mut!(HEAP) as *mut u8
+}
+```
+
+- allocator 코드에서 HEAP 접근은 아래 패턴만 사용한다.
+  - 주소 계산:
+
+```rust
+let addr = unsafe { heap_base_ptr().add(aligned_offset) };
+```
+
+  - offset 계산:
+
+```rust
+let offset = unsafe { ptr.offset_from(heap_base_ptr()) as usize };
+```
+
+## MyHeap 설계 규칙
+
+- heap 상태는 아래와 같이 관리한다.
+
+```rust
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    offset: usize,
+    size: usize,
+    free: bool,
+}
+
+#[derive(Debug)]
+struct MyHeap {
+    blocks: Vec<Block>,
+}
+```
+
+- 초기 상태:
+  - `blocks` 는 arena 전체를 하나의 free block 으로 가진다.
+
+```rust
+MyHeap {
+    blocks: vec![Block {
+        offset: 0,
+        size: HEAP_SIZE,
+        free: true,
+    }],
+}
+```
+
+- `alloc` 구현 시 규칙:
+  - first-fit 로 free block 을 찾는다.
+  - `align_up` 으로 aligned offset 을 계산한다.
+  - 필요하면 [padding free][used][remaining free] 로 block 을 분할한다.
+  - arena 경계를 넘지 않도록 `offset + size <= HEAP_SIZE` 를 항상 보장한다.
+- `dealloc` 구현 시 규칙:
+  - ptr → offset 으로 되돌린 뒤, 해당 block 을 `free = true` 로 바꾼다.
+  - 인접 free block 과는 **항상 병합(coalesce)** 해서 단편화를 줄인다.
+  - `blocks` 는 `offset` 기준 오름차순 정렬 상태를 유지한다.
+
+## MyBox<T> 규칙
+
+- `MyBox<T>` 는 heap 데이터에 대한 **작은 핸들**이어야 하며, 스택에 두고 쓴다.
+
+```rust
+struct MyBox<T> {
+    ptr: *mut T,
+}
+```
+
+- `MyBox::new` 구현 시:
+  - 반드시 `MyHeap::alloc(size_of::<T>(), align_of::<T>())` 를 통해 메모리를 받는다.
+  - 값을 쓸 때는 `raw.write(value)` 를 사용하고, 이 부분에만 `unsafe` 를 최소 범위로 둘렀다.
+
+- `MyBox` 의 read/write:
+  - 읽기: `unsafe { &*self.ptr }`
+  - 쓰기: `unsafe { &mut *self.ptr }`
+  - `unsafe` 범위는 이 두 곳에만 둔다.
+
+- 현재 토이 설계에서는 `MyBox::free(self, heap: &mut MyHeap)` 로 명시적으로 해제한다.
+  - `Drop` 으로 자동 해제를 추가할 경우:
+    - `MyHeap` 접근을 동기화(예: 전역 `Mutex<MyHeap>`) 하고,
+    - aliasing/라이프타임을 더 엄격히 고려해야 한다.
+
+## 관찰 패턴
+
+- stack / real heap / toy heap 차이를 볼 때는 다음을 출력해서 비교한다.
+  - `heap_base_ptr()` (toy heap arena 시작 주소)
+  - 스택 지역 변수 주소 (`&local`)
+  - 진짜 `Box` 의 핸들 주소 (`&box`) 와 내부 데이터 주소 (`&*box`)
+  - `MyBox` 핸들 주소 (`&my_box`) 와 내부 포인터 (`my_box.as_ptr()`)
+- `MyHeap::dump_blocks()` 결과와 위 주소들을 항상 같이 보면서,
+  offset ↔ 실제 주소 차이를 대응시킨다.
+
